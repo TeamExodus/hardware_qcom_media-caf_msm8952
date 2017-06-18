@@ -271,6 +271,7 @@ omx_video::omx_video():
     output_use_buffer (false),
     pending_input_buffers(0),
     pending_output_buffers(0),
+    allocate_native_handle(false),
     m_out_bm_count(0),
     m_inp_bm_count(0),
     m_flags(0),
@@ -2147,6 +2148,8 @@ OMX_ERRORTYPE  omx_video::get_config(OMX_IN OMX_HANDLETYPE      hComp,
 
 }
 
+#define extn_equals(param, extn) (!strcmp(param, extn))
+
 /* ======================================================================
    FUNCTION
    omx_video::GetExtensionIndex
@@ -2194,6 +2197,12 @@ OMX_ERRORTYPE  omx_video::get_extension_index(OMX_IN OMX_HANDLETYPE      hComp,
         *indexType = (OMX_INDEXTYPE)OMX_QTIIndexConfigDescribeColorAspects;
         return OMX_ErrorNone;
     }
+
+    if (extn_equals(paramName, "OMX.google.android.index.allocateNativeHandle")) {
+        *indexType = (OMX_INDEXTYPE)OMX_GoogleAndroidIndexAllocateNativeHandle;
+        return OMX_ErrorNone;
+    }
+
     return OMX_ErrorNotImplemented;
 }
 
@@ -2768,17 +2777,23 @@ OMX_ERRORTYPE omx_video::free_output_buffer(OMX_BUFFERHEADERTYPE *bufferHdr)
             if(!secure_session) {
                 munmap (m_pOutput_pmem[index].buffer,
                         m_pOutput_pmem[index].size);
-            } else {
-                char *data = (char*) m_pOutput_pmem[index].buffer;
-                native_handle_t *handle = NULL;
-                memcpy(&handle, data + sizeof(OMX_U32), sizeof(native_handle_t*));
+                close (m_pOutput_pmem[index].fd);
+            } else if (m_pOutput_pmem[index].buffer) {
+                native_handle_t *handle;
+                if (allocate_native_handle) {
+                    handle = (native_handle_t *)m_pOutput_pmem[index].buffer;
+                } else {
+                    handle = ((output_metabuffer *)m_pOutput_pmem[index].buffer)->nh;
+                    free(m_pOutput_pmem[index].buffer);
+                }
+                native_handle_close(handle);
                 native_handle_delete(handle);
-                free(m_pOutput_pmem[index].buffer);
             }
-            close (m_pOutput_pmem[index].fd);
 #ifdef USE_ION
             free_ion_memory(&m_pOutput_ion[index]);
 #endif
+
+            m_pOutput_pmem[index].buffer = NULL;
             m_pOutput_pmem[index].fd = -1;
         } else if ( m_pOutput_pmem[index].fd > 0 && (output_use_buffer == true
                     && m_use_output_pmem == OMX_FALSE)) {
@@ -3163,20 +3178,37 @@ OMX_ERRORTYPE  omx_video::allocate_output_buffer(
             else {
                 //This should only be used for passing reference to source type and
                 //secure handle fd struct native_handle_t*
-                native_handle_t *handle = native_handle_create(1, 3); //fd, offset, size, alloc length
-                if (!handle) {
-                    DEBUG_PRINT_ERROR("ERROR: native handle creation failed");
-                    return OMX_ErrorInsufficientResources;
+                if (allocate_native_handle) {
+                    native_handle_t *nh = native_handle_create(1 /*numFds*/, 3 /*numInts*/);
+                    if (!nh) {
+                        DEBUG_PRINT_ERROR("Native handle create failed");
+                        return OMX_ErrorInsufficientResources;
+                    }
+                    nh->data[0] = m_pOutput_pmem[i].fd;
+                    nh->data[1] = 0;
+                    nh->data[2] = 0;
+                    nh->data[3] = ALIGN(m_sOutPortDef.nBufferSize, 4096);
+                    m_pOutput_pmem[i].buffer = (OMX_U8 *)nh;
+                } else {
+                    native_handle_t *handle = native_handle_create(1, 3); //fd, offset, size, alloc length
+                    if (!handle) {
+                        DEBUG_PRINT_ERROR("ERROR: native handle creation failed");
+                        return OMX_ErrorInsufficientResources;
+                    }
+                    m_pOutput_pmem[i].buffer = malloc(sizeof(output_metabuffer));
+                    if (m_pOutput_pmem[i].buffer == NULL) {
+                        DEBUG_PRINT_ERROR("%s: Failed to allocate meta buffer", __func__);
+                        return OMX_ErrorInsufficientResources;
+                    }
+                    (*bufferHdr)->nAllocLen = sizeof(output_metabuffer);
+                    handle->data[0] = m_pOutput_pmem[i].fd;
+                    handle->data[1] = 0;
+                    handle->data[2] = 0;
+                    handle->data[3] = ALIGN(m_sOutPortDef.nBufferSize, 4096);
+                    output_metabuffer *buffer = (output_metabuffer*) m_pOutput_pmem[i].buffer;
+                    buffer->type = 1;
+                    buffer->nh = handle;
                 }
-                m_pOutput_pmem[i].buffer = malloc(sizeof(output_metabuffer));
-                (*bufferHdr)->nAllocLen = sizeof(output_metabuffer);
-                handle->data[0] = m_pOutput_pmem[i].fd;
-                handle->data[1] = 0;
-                handle->data[2] = 0;
-                handle->data[3] = ALIGN(m_sOutPortDef.nBufferSize, 4096);
-                output_metabuffer *buffer = (output_metabuffer*) m_pOutput_pmem[i].buffer;
-                buffer->type = 1;
-                buffer->nh = handle;
             }
 
             (*bufferHdr)->pBuffer = (OMX_U8 *)m_pOutput_pmem[i].buffer;
